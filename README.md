@@ -1,6 +1,6 @@
 # filterAPI-infra
 
-DevOps repository for **ERPal** — contains Kubernetes manifests, Nginx reverse proxy configuration, CI/CD deploy pipeline, and Prometheus/Grafana monitoring stack.
+DevOps repository for **ERPal** — contains Kubernetes manifests, Nginx reverse proxy configuration, CI/CD deploy pipeline, Prometheus/Grafana monitoring stack, and **Terraform AWS infrastructure**.
 
 Application source code lives in [tehtipsy/filterAPI](https://github.com/tehtipsy/filterAPI).
 
@@ -8,33 +8,124 @@ Application source code lives in [tehtipsy/filterAPI](https://github.com/tehtips
 
 ```
 filterAPI-infra/
-├── k8s/                    # Kubernetes manifests
+├── terraform/                  # AWS infrastructure as code
+│   ├── versions.tf             # Provider/Terraform version constraints, S3 backend template
+│   ├── variables.tf            # All input variables
+│   ├── main.tf                 # VPC + EKS modules
+│   ├── ecr.tf                  # ECR repository + lifecycle policy
+│   ├── iam.tf                  # GitHub Actions OIDC provider + IAM role
+│   ├── outputs.tf              # Cluster endpoint, ECR URL, OIDC role ARN
+│   ├── terraform.tfvars.example
+│   └── .gitignore
+├── k8s/                        # Kubernetes manifests
 │   ├── namespace.yaml
 │   ├── configmap.yaml
-│   ├── secret.yaml         # Template — no real values committed
+│   ├── secret.yaml             # Template — no real values committed
 │   ├── pvc.yaml
 │   ├── deployment.yaml
 │   ├── service.yaml
 │   └── ingress.yaml
 ├── nginx/
-│   └── default.conf        # Nginx reverse proxy config
+│   └── default.conf            # Nginx reverse proxy config
 ├── monitoring/
-│   ├── prometheus.yml      # Prometheus scrape config
-│   ├── docker-compose.yml  # Local monitoring stack
+│   ├── prometheus.yml          # Prometheus scrape config
+│   ├── docker-compose.yml      # Local monitoring stack
 │   └── grafana/
 │       └── provisioning/
 │           └── datasources/
 │               └── prometheus.yml
 └── .github/workflows/
-    └── deploy.yml          # K8s deploy pipeline
+    ├── terraform.yml           # Terraform plan + apply pipeline
+    └── deploy.yml              # K8s manifest deploy pipeline
 ```
 
-## Prerequisites
+---
 
-- `kubectl` configured against your cluster
-- Docker Hub account (or any OCI registry)
-- A running Kubernetes cluster (Minikube / Kind / K3s / cloud)
-- Nginx Ingress Controller installed on the cluster
+## Terraform — AWS Infrastructure
+
+The `terraform/` directory provisions the full AWS infrastructure for ERPal using the official `terraform-aws-modules` community modules.
+
+| Resource | Details |
+|---|---|
+| **VPC** | 2 AZs, public + private subnets, single NAT gateway |
+| **EKS** | Managed node group, `t3.medium` × 2 nodes (configurable) |
+| **ECR** | Private image registry with scan-on-push + 10-image lifecycle policy |
+| **IAM OIDC** | GitHub Actions role (no static AWS credentials needed) |
+
+### Prerequisites
+
+- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.6
+- [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) configured (`aws configure`)
+- An S3 bucket for remote state (recommended before first apply)
+
+### Quick Start
+
+```bash
+cd terraform/
+
+# Copy and edit variable values
+cp terraform.tfvars.example terraform.tfvars
+
+# Initialise providers (optionally configure S3 backend in versions.tf first)
+terraform init
+
+# Preview all changes
+terraform plan
+
+# Apply
+terraform apply
+```
+
+After apply, configure `kubectl`:
+
+```bash
+$(terraform output -raw configure_kubectl)
+```
+
+Then apply the Kubernetes manifests (see [Kubernetes Setup](#kubernetes-setup) below).
+
+### Remote State (Recommended)
+
+Create the S3 bucket and DynamoDB lock table once:
+
+```bash
+aws s3api create-bucket \
+  --bucket your-terraform-state-bucket \
+  --region us-east-1
+
+aws dynamodb create-table \
+  --table-name terraform-state-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+```
+
+Then uncomment and fill in the `backend "s3"` block in `terraform/versions.tf`, and re-run `terraform init`.
+
+### Connecting GitHub Actions to AWS (OIDC)
+
+The Terraform configuration creates an OIDC identity provider and a scoped IAM role so GitHub Actions **never needs static AWS credentials**.
+
+After `terraform apply`, grab the outputs:
+
+```bash
+terraform output github_actions_role_arn   # → add as AWS_ROLE_ARN secret
+terraform output ecr_repository_url        # → add as IMAGE_DOCKER_REPO secret
+terraform output aws_region                # → add as AWS_REGION secret
+```
+
+Add these three values as repository secrets in **both** `tehtipsy/filterAPI` and `tehtipsy/filterAPI-infra`.
+
+The `terraform.yml` CI pipeline then runs automatically on every push/PR that changes files under `terraform/`:
+
+| Step | On push to `main` | On pull request |
+|---|---|---|
+| fmt / validate | ✓ | ✓ |
+| plan (with PR comment) | ✓ | ✓ |
+| apply | ✓ | ✗ |
+
+---
 
 ## Kubernetes Setup
 
@@ -55,23 +146,8 @@ kubectl create secret generic erpal-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-Or use the template as a reference:
-```bash
-# Edit k8s/secret.yaml to fill in values, then:
-kubectl apply -f k8s/secret.yaml -n erpal
-```
-
 ### 3. Apply all remaining manifests
 
-```bash
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/pvc.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-kubectl apply -f k8s/ingress.yaml
-```
-
-Or apply the whole directory at once:
 ```bash
 kubectl apply -f k8s/ -n erpal
 ```
@@ -84,15 +160,17 @@ kubectl rollout status deployment/erpal-app -n erpal
 kubectl get ingress -n erpal
 ```
 
+---
+
 ## Nginx
 
-The `nginx/default.conf` configures a reverse proxy to the `erpal-service` ClusterIP. The `/metrics` path is restricted to the internal network only.
+`nginx/default.conf` configures a reverse proxy to the `erpal-service` ClusterIP. The `/metrics` path is restricted to RFC-1918 ranges only. For the Nginx Ingress Controller the `k8s/ingress.yaml` already sets `ingressClassName: nginx`.
 
-To use this with Nginx Ingress Controller, the Ingress resource in `k8s/ingress.yaml` already references the `nginx` ingressClassName. For a standalone Nginx pod or bare-metal deployment, mount `nginx/default.conf` as a ConfigMap volume.
+---
 
 ## Monitoring
 
-### Local stack (Prometheus + Grafana via Docker Compose)
+### Local stack (Prometheus + Grafana)
 
 ```bash
 cd monitoring/
@@ -102,35 +180,27 @@ docker compose up -d
 - Prometheus: http://localhost:9090
 - Grafana: http://localhost:3001 (admin / admin)
 
-The Grafana Prometheus datasource is auto-provisioned. Import a Node.js dashboard (e.g. Grafana Dashboard ID **11956**) to visualise ERPal metrics.
+The Grafana Prometheus datasource is auto-provisioned. Import dashboard ID **11956** (Node.js) to visualise ERPal's `http_requests_total` and `http_request_duration_seconds` metrics.
 
 ### Cluster scraping
 
-The Deployment pods are annotated with:
+Deployment pods are annotated so Prometheus auto-discovers them via Kubernetes service discovery:
+
 ```yaml
 prometheus.io/scrape: "true"
 prometheus.io/port: "3000"
 prometheus.io/path: "/metrics"
 ```
 
-The `monitoring/prometheus.yml` uses Kubernetes service discovery to scrape all annotated pods in the `erpal` namespace automatically.
-
-## CI/CD Pipeline
-
-The `.github/workflows/deploy.yml` pipeline triggers on every push to `main` and applies the K8s manifests in order. It requires the `KUBECONFIG` secret (base64-encoded kubeconfig).
-
-```bash
-# Encode your kubeconfig for the secret:
-base64 -w 0 ~/.kube/config
-```
-
-Add the output as the `KUBECONFIG` repository secret in GitHub Settings → Secrets.
+---
 
 ## Best Practices Implemented
 
-- **Non-root container**: Deployment runs as `appuser` (UID 1000) with `runAsNonRoot: true`
-- **Resource limits**: CPU and memory requests/limits set on all containers
-- **Health probes**: Liveness and readiness probes on `/metrics`
-- **Namespace isolation**: All resources scoped to the `erpal` namespace
-- **Secret management**: Secrets never committed — created from env file or external secret manager
-- **Persistent storage**: SQLite data persisted via a PVC (ReadWriteOnce)
+| Area | Detail |
+|---|---|
+| **Security** | Non-root container (`runAsUser: 1000`); OIDC auth (no static credentials); secrets never committed |
+| **Reliability** | Liveness + readiness probes; `RollingUpdate` deployment strategy; `replicas: 2` |
+| **Resources** | CPU/memory requests and limits on every container |
+| **Storage** | SQLite data persisted via `ReadWriteOnce` PVC |
+| **Observability** | Prometheus annotations; `/metrics` endpoint; Grafana dashboards |
+| **IaC** | All AWS infra in Terraform; `.tfstate` excluded from git; example tfvars only |
