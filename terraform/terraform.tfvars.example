@@ -1,0 +1,10 @@
+aws_region         = "us-east-1"
+environment        = "prod"
+cluster_name       = "erpal-cluster"
+cluster_version    = "1.29"
+vpc_cidr           = "10.0.0.0/16"
+node_instance_type = "t3.medium"
+node_min_size      = 1
+node_max_size      = 3
+node_desired_size  = 2
+github_repo        = "tehtipsy/filterAPI"
