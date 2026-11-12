@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: erpal-config
+  namespace: erpal
+data:
+  EXPRESS_PORT: "3000"
+  SHOPIFY_API_VERSION: "2024-01"
+  NODE_ENV: "production"
+  DASHBOARD_HTML_FOLDER_PATH: "/filterAPI/src/dashboard/templates"
